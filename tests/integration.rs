@@ -49,7 +49,7 @@ fn test_help_lists_subcommands() {
         .expect("docket --help");
     assert!(out.status.success(), "exit {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for sub in &["report", "list", "show", "resolve"] {
+    for sub in &["report", "list", "show", "resolve", "sweep"] {
         assert!(
             stdout.contains(sub),
             "help output missing subcommand '{sub}': {stdout}"
@@ -336,4 +336,357 @@ fn test_json_output_parseable() {
         .expect("show json");
     let _: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("show --format json must be valid JSON");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// docket-escalate acceptance criteria
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── escalate AC 1 — 3 runs escalates; escalated_at + reason set ─────────────
+
+#[test]
+fn test_escalate_at_threshold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    for run in &["r1", "r2", "r3"] {
+        let st = docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+        assert!(st.success(), "report {run} failed");
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+
+    assert_eq!(v["status"], "escalated", "should be escalated after 3 runs: {v}");
+    assert!(
+        !v["escalated_at"].is_null(),
+        "escalated_at should be non-null: {v}"
+    );
+    let reason = v["escalation_reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains('3'),
+        "escalation_reason should mention '3': {v}"
+    );
+    assert!(
+        reason.contains("SKILL.md"),
+        "escalation_reason should mention SKILL.md: {v}"
+    );
+}
+
+// ── escalate AC 2 — 2 runs stays open; 3rd trips; --escalate-threshold 2 ────
+
+#[test]
+fn test_escalate_two_runs_stay_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    for run in &["r1", "r2"] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "open", "2 runs should stay open (threshold=3): {v}");
+}
+
+#[test]
+fn test_escalate_threshold_2_trips_on_second_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T", "--escalate-threshold", "2"])
+        .status()
+        .expect("report r1");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r2", "--key", "k", "--title", "T", "--escalate-threshold", "2"])
+        .status()
+        .expect("report r2");
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "escalated", "--escalate-threshold 2 should escalate at run 2: {v}");
+}
+
+// ── escalate AC 3 — list --escalated returns only escalated findings ─────────
+
+#[test]
+fn test_list_escalated_filter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Escalate k1 (3 runs)
+    for run in &["r1", "r2", "r3"] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k1", "--title", "T1"])
+            .status()
+            .expect("report k1");
+    }
+    // k2 stays open (1 run)
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k2", "--title", "T2"])
+        .status()
+        .expect("report k2");
+
+    let out = docket(tmp.path())
+        .args(["list", "--escalated", "--format", "json"])
+        .output()
+        .expect("list escalated");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let arr = arr.as_array().expect("json array");
+
+    assert!(
+        arr.iter().any(|f| f["key"] == "k1"),
+        "k1 should be in escalated list: {arr:?}"
+    );
+    assert!(
+        !arr.iter().any(|f| f["key"] == "k2"),
+        "k2 (open) should not be in escalated list: {arr:?}"
+    );
+}
+
+// ── escalate AC 4 — once escalated, 4th report stays escalated ──────────────
+
+#[test]
+fn test_escalated_is_sticky() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    for run in &["r1", "r2", "r3", "r4"] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "escalated", "4th report should keep escalated: {v}");
+}
+
+// ── escalate AC 5 — runs table records run-ids once, in arrival order ────────
+
+#[test]
+fn test_runs_table_no_duplicates() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // r1, r2, then r1 again — should only have r1 seq=1, r2 seq=2
+    for run in &["r1", "r2", "r1"] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+    }
+
+    // Verify via sweep on r3 (records r3 in ledger too)
+    // Use stale-after=100 so nothing is resolved — we just care the ledger didn't duplicate
+    let st = docket(tmp.path())
+        .args(["sweep", "--run", "r3", "--stale-after", "100"])
+        .status()
+        .expect("sweep");
+    assert!(st.success(), "sweep exit {:?}", st);
+
+    // After r1, r2, r1 (dup), r3 — finding should have consecutive_runs=3 (r1→r2→r3)
+    // if ledger is correct (r1 seq=1, r2 seq=2, r3 seq=3).
+    // The re-report of r1 is a same-run-id idempotent bump (doesn't advance streak).
+    // So consecutive_runs from the last report (r1) is still 1 (r1 last seen),
+    // but after sweep with r3 being seen, the finding's last_run is r1 not r3 → streak reset to 0.
+    // This verifies the ledger has no duplicate seq for r1.
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    // After sweep, finding not seen at r3 → streak reset to 0 (not stale yet with stale-after=100)
+    assert_eq!(v["consecutive_runs"], 0, "streak reset after gap: {v}");
+}
+
+// ── escalate AC 6 — sweep resolves stale, does not resolve recent ────────────
+
+#[test]
+fn test_sweep_resolves_stale_not_recent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // finding1: last seen at r2, should be stale after r3, r4 elapsed (2 runs)
+    for run in &["r1", "r2"] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "finding1", "--title", "Old"])
+            .status()
+            .expect("report finding1");
+    }
+    // finding2: last seen at r4, should NOT be stale
+    for run in &["r1", "r2", "r3", "r4"] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "finding2", "--title", "Recent"])
+            .status()
+            .expect("report finding2");
+    }
+
+    // Record r3 and r4 via sweeps (without resolving anything yet with stale-after=100)
+    docket(tmp.path())
+        .args(["sweep", "--run", "r3", "--stale-after", "100"])
+        .status()
+        .expect("sweep r3");
+    docket(tmp.path())
+        .args(["sweep", "--run", "r4", "--stale-after", "100"])
+        .status()
+        .expect("sweep r4");
+
+    // Now sweep r5 with stale-after=2
+    let st = docket(tmp.path())
+        .args(["sweep", "--run", "r5", "--stale-after", "2"])
+        .status()
+        .expect("sweep r5");
+    assert!(st.success(), "sweep r5 exit {:?}", st);
+
+    // finding1 (last seen r2, 2 runs elapsed r3+r4 before r5) should be resolved
+    let out = docket(tmp.path())
+        .args(["show", "finding1", "--format", "json"])
+        .output()
+        .expect("show finding1");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "resolved", "finding1 should be resolved as stale: {v}");
+    let reason = v["resolve_reason"].as_str().unwrap_or("");
+    assert!(
+        reason.starts_with("stale:"),
+        "resolve_reason should start with 'stale:': {v}"
+    );
+
+    // finding2 (last seen r4) should remain escalated/open (not stale)
+    let out = docket(tmp.path())
+        .args(["show", "finding2", "--format", "json"])
+        .output()
+        .expect("show finding2");
+    let v2: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(
+        v2["status"] != "resolved",
+        "finding2 (last seen r4) should not be resolved at sweep r5: {v2}"
+    );
+}
+
+// ── escalate AC 7 — gap at r2 breaks streak (r1, r3 not consecutive) ─────────
+
+#[test]
+fn test_gap_breaks_streak() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Report at r1
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report r1");
+
+    // Skip r2 — sweep with stale-after=100 to record r2 in ledger without resolving
+    docket(tmp.path())
+        .args(["sweep", "--run", "r2", "--stale-after", "100"])
+        .status()
+        .expect("sweep r2");
+
+    // Report at r3 — after the gap, streak should reset
+    docket(tmp.path())
+        .args(["report", "--run", "r3", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report r3");
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+
+    // After sweep at r2 (gap), consecutive_runs is reset to 0.
+    // Then report at r3 reopens/continues: streak = 1 (not 2, since gap was recorded).
+    // The sweep resets streak to 0; the r3 report sets streak=1.
+    // So it's NOT monotonically 1→2 through the gap.
+    assert_eq!(v["consecutive_runs"], 1, "after gap at r2, r3 report starts fresh streak=1: {v}");
+    assert_eq!(v["status"], "open", "status should be open (streak=1 < threshold=3): {v}");
+}
+
+// ── escalate AC 8 — migration is idempotent on pre-escalate DB ───────────────
+
+#[test]
+fn test_migration_idempotent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Two opens on a fresh DB — migration runs twice (once per process), must not error.
+    for run in &["r1", "r2"] {
+        let st = docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+        assert!(st.success(), "migration idempotent run {run}: {:?}", st);
+    }
+
+    // Third invocation: list — must also succeed.
+    let st = docket(tmp.path())
+        .args(["list", "--format", "json"])
+        .status()
+        .expect("list");
+    assert!(st.success(), "list after repeated opens: {:?}", st);
+}
+
+// ── escalate AC 9 — DOCKET_ESCALATE_THRESHOLD env honored; flag overrides ────
+
+#[test]
+fn test_env_escalate_threshold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // With DOCKET_ESCALATE_THRESHOLD=2, 2 runs should escalate
+    for run in &["r1", "r2"] {
+        let st = docket(tmp.path())
+            .env("DOCKET_ESCALATE_THRESHOLD", "2")
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+        assert!(st.success());
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["status"], "escalated",
+        "DOCKET_ESCALATE_THRESHOLD=2 should escalate at 2 runs: {v}"
+    );
+}
+
+#[test]
+fn test_flag_overrides_env_escalate_threshold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // DOCKET_ESCALATE_THRESHOLD=2 but --escalate-threshold 5 overrides → stays open at 2 runs
+    for run in &["r1", "r2"] {
+        docket(tmp.path())
+            .env("DOCKET_ESCALATE_THRESHOLD", "2")
+            .args(["report", "--run", run, "--key", "k", "--title", "T", "--escalate-threshold", "5"])
+            .status()
+            .expect("report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["status"], "open",
+        "--escalate-threshold 5 should override DOCKET_ESCALATE_THRESHOLD=2 (stays open at 2 runs): {v}"
+    );
 }

@@ -51,6 +51,8 @@ impl std::fmt::Display for Severity {
 pub enum Status {
     /// The finding is currently open.
     Open,
+    /// The finding has been escalated — it recurred ≥ threshold consecutive runs.
+    Escalated,
     /// The finding has been resolved.
     Resolved,
 }
@@ -59,6 +61,7 @@ impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Open => write!(f, "open"),
+            Self::Escalated => write!(f, "escalated"),
             Self::Resolved => write!(f, "resolved"),
         }
     }
@@ -95,6 +98,10 @@ pub struct Finding {
     pub resolve_reason: Option<String>,
     /// Latest evidence reference (raw string), or null.
     pub evidence: Option<String>,
+    /// `RFC3339` timestamp when escalated, or null.
+    pub escalated_at: Option<String>,
+    /// Reason for escalation (cites threshold + SKILL.md §359), or null.
+    pub escalation_reason: Option<String>,
 }
 
 impl Finding {
@@ -110,8 +117,15 @@ impl Finding {
             .evidence
             .as_ref()
             .map_or_else(String::new, |e| format!("\n  evidence: {e}"));
+        let escalation_info = match (&self.escalated_at, &self.escalation_reason) {
+            (Some(at), Some(reason)) => {
+                format!("\n  escalated_at: {at}\n  escalation_reason: {reason}")
+            }
+            (Some(at), None) => format!("\n  escalated_at: {at}"),
+            _ => String::new(),
+        };
         format!(
-            "[{status}] {key} ({severity})\n  title: {title}\n  first_seen: {first_seen}\n  last_seen: {last_seen}\n  first_run: {first_run}\n  last_run: {last_run}\n  runs_seen: {runs_seen}  consecutive_runs: {consecutive_runs}  report_count: {report_count}{resolved_info}{evidence_info}",
+            "[{status}] {key} ({severity})\n  title: {title}\n  first_seen: {first_seen}\n  last_seen: {last_seen}\n  first_run: {first_run}\n  last_run: {last_run}\n  runs_seen: {runs_seen}  consecutive_runs: {consecutive_runs}  report_count: {report_count}{resolved_info}{escalation_info}{evidence_info}",
             status = self.status,
             key = self.key,
             severity = self.severity,
@@ -125,4 +139,15 @@ impl Finding {
             report_count = self.report_count,
         )
     }
+}
+
+/// A single run ledger row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunEntry {
+    /// Run identifier (caller-supplied opaque string).
+    pub run_id: String,
+    /// Monotonic sequence number (1-based, in arrival order).
+    pub seq: i64,
+    /// `RFC3339` timestamp when this run_id was first seen.
+    pub seen_at: String,
 }
