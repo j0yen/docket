@@ -49,7 +49,7 @@ fn test_help_lists_subcommands() {
         .expect("docket --help");
     assert!(out.status.success(), "exit {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for sub in &["report", "list", "show", "resolve", "sweep"] {
+    for sub in &["report", "list", "show", "resolve", "sweep", "digest"] {
         assert!(
             stdout.contains(sub),
             "help output missing subcommand '{sub}': {stdout}"
@@ -689,4 +689,316 @@ fn test_flag_overrides_env_escalate_threshold() {
         v["status"], "open",
         "--escalate-threshold 5 should override DOCKET_ESCALATE_THRESHOLD=2 (stays open at 2 runs): {v}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// docket-digest acceptance criteria
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── digest AC 1 — empty store: text is single clean line, json has status=ok ──
+
+#[test]
+fn digest_empty_store_text_single_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = docket(tmp.path())
+        .args(["digest"])
+        .output()
+        .expect("digest empty");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim();
+    assert_eq!(trimmed, "docket: 0 open", "empty text: {trimmed:?}");
+    assert_eq!(trimmed.lines().count(), 1, "single line: {trimmed:?}");
+}
+
+#[test]
+fn digest_empty_store_json_status_ok() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest empty json");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(v["status"], "ok", "empty store status: {v}");
+    assert_eq!(v["detail"]["open"], 0);
+    assert_eq!(v["detail"]["escalated"], 0);
+    assert_eq!(v["component"], "docket");
+}
+
+// ── digest AC 2 — 4 open + 1 escalated: text reports counts + oldest ─────────
+
+#[test]
+fn digest_four_open_one_escalated_text() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // 4 open findings
+    for (key, run_count) in &[("o1", 1i32), ("o2", 2), ("o3", 3), ("o4-crit", 1)] {
+        for r in 1..=*run_count {
+            docket(tmp.path())
+                .args(["report", "--run", &format!("r{r}"), "--key", key, "--title", key])
+                .status()
+                .expect("report open");
+        }
+    }
+    // o4-crit: mark as crit
+    docket(tmp.path())
+        .args(["report", "--run", "rx", "--key", "o4-crit", "--title", "crit finding", "--severity", "crit"])
+        .status()
+        .expect("report crit");
+
+    // 1 escalated finding: report 12 distinct runs
+    for r in 1..=12_i32 {
+        docket(tmp.path())
+            .args([
+                "report", "--run", &format!("esc-r{r}"),
+                "--key", "escalated-finding",
+                "--title", "escalated finding",
+                "--escalate-threshold", "3",
+            ])
+            .status()
+            .expect("report escalated");
+    }
+
+    let out = docket(tmp.path())
+        .args(["digest"])
+        .output()
+        .expect("digest");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Must mention open count (4 open across all open findings, plus escalated-finding is escalated)
+    assert!(stdout.contains("open"), "open count: {stdout}");
+    // Must mention escalated
+    assert!(stdout.contains("escalated"), "escalated: {stdout}");
+    // Must mention oldest finding by name (runs_seen=12 → escalated-finding)
+    assert!(stdout.contains("escalated-finding"), "oldest: {stdout}");
+    // ≤3 lines
+    let line_count = stdout.trim().lines().count();
+    assert!(line_count <= 3, "≤3 lines ({line_count}): {stdout:?}");
+}
+
+// ── digest AC 3 — json field names match wm.health.* envelope ────────────────
+
+#[test]
+fn digest_json_envelope_field_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+
+    // Top-level fields required by the wm.health.* envelope spec
+    assert!(v.get("component").is_some(), "missing 'component': {v}");
+    assert!(v.get("status").is_some(), "missing 'status': {v}");
+    assert!(v.get("summary").is_some(), "missing 'summary': {v}");
+    assert!(v.get("detail").is_some(), "missing 'detail': {v}");
+
+    let d = &v["detail"];
+    assert!(d.get("open").is_some(), "missing detail.open: {v}");
+    assert!(d.get("escalated").is_some(), "missing detail.escalated: {v}");
+    assert!(d.get("crit").is_some(), "missing detail.crit: {v}");
+    assert!(d.get("oldest_key").is_some(), "missing detail.oldest_key: {v}");
+    assert!(d.get("oldest_runs").is_some(), "missing detail.oldest_runs: {v}");
+    assert!(d.get("escalated_keys").is_some(), "missing detail.escalated_keys: {v}");
+    assert_eq!(v["component"], "docket");
+}
+
+// ── digest AC 4 — status mapping branches ────────────────────────────────────
+
+#[test]
+fn digest_status_mapping_open_only_is_ok() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "ok", "open-only should be ok: {v}");
+}
+
+#[test]
+fn digest_status_mapping_escalated_is_degraded() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // 3 runs → escalated (threshold=3)
+    for r in 1..=3_i32 {
+        docket(tmp.path())
+            .args(["report", "--run", &format!("r{r}"), "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "degraded", "escalated (warn) should be degraded: {v}");
+}
+
+#[test]
+fn digest_status_mapping_escalated_crit_is_down() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // 3 runs with severity=crit → escalated crit
+    for r in 1..=3_i32 {
+        docket(tmp.path())
+            .args([
+                "report", "--run", &format!("r{r}"),
+                "--key", "k", "--title", "T",
+                "--severity", "crit",
+            ])
+            .status()
+            .expect("report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "down", "escalated crit should be down: {v}");
+}
+
+// ── digest AC 5 — --severity warn excludes info findings ─────────────────────
+
+#[test]
+fn digest_severity_filter_excludes_info() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Report an info finding only
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "info-k", "--title", "T", "--severity", "info"])
+        .status()
+        .expect("report info");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json", "--severity", "warn"])
+        .output()
+        .expect("digest json severity=warn");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "ok", "info finding should be excluded by --severity warn: {v}");
+    assert_eq!(v["detail"]["open"], 0, "open should be 0 after info excluded: {v}");
+}
+
+// ── digest AC 6 — oldest uses runs_seen, stable across formats ───────────────
+
+#[test]
+fn digest_oldest_uses_run_age() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // k1: 1 run, k2: 5 runs, k3: 2 runs — k2 should be oldest
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k1", "--title", "T1"])
+        .status()
+        .expect("report k1");
+    for r in 1..=5_i32 {
+        docket(tmp.path())
+            .args(["report", "--run", &format!("r{r}"), "--key", "k2", "--title", "T2"])
+            .status()
+            .expect("report k2");
+    }
+    for r in 1..=2_i32 {
+        docket(tmp.path())
+            .args(["report", "--run", &format!("r{r}"), "--key", "k3", "--title", "T3"])
+            .status()
+            .expect("report k3");
+    }
+
+    // JSON check
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        v["detail"]["oldest_key"], "k2",
+        "oldest should be k2 (5 runs): {v}"
+    );
+    assert_eq!(v["detail"]["oldest_runs"], 5);
+
+    // Text check — should also name k2
+    let out = docket(tmp.path())
+        .args(["digest"])
+        .output()
+        .expect("digest text");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("k2"), "text should name oldest (k2): {stdout}");
+}
+
+// ── digest AC 7 — json parseable; text ≤3 lines ──────────────────────────────
+
+#[test]
+fn digest_json_parseable_with_jq() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    // Verify valid JSON parseable by serde_json (same as jq can parse)
+    let _: serde_json::Value = serde_json::from_slice(&out.stdout).expect("digest json must be valid JSON");
+}
+
+#[test]
+fn digest_text_max_three_lines() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // escalated finding
+    for r in 1..=3_i32 {
+        docket(tmp.path())
+            .args(["report", "--run", &format!("r{r}"), "--key", "esc", "--title", "E"])
+            .status()
+            .expect("report esc");
+    }
+    // open finding
+    docket(tmp.path())
+        .args(["report", "--run", "ro1", "--key", "open1", "--title", "O"])
+        .status()
+        .expect("report open");
+
+    let out = docket(tmp.path())
+        .args(["digest"])
+        .output()
+        .expect("digest text");
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line_count = stdout.trim().lines().count();
+    assert!(line_count <= 3, "text must be ≤3 lines ({line_count}): {stdout:?}");
+}
+
+// ── digest AC 10 — no escalated: degrades gracefully, escalated=0 ────────────
+
+#[test]
+fn digest_no_escalated_graceful() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["detail"]["escalated"], 0);
+    let keys = v["detail"]["escalated_keys"].as_array().expect("array");
+    assert!(keys.is_empty(), "escalated_keys empty when no escalations: {v}");
 }

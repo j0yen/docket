@@ -5,6 +5,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::db;
+use crate::digest;
 use crate::error::Result;
 
 /// A structured ledger for standing findings.
@@ -108,6 +109,18 @@ pub(crate) enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Digest: compact rollup of open/escalated findings for banners and health checks.
+    ///
+    /// Text output (default): ≤3-line banner safe to inline in SessionStart.
+    /// JSON output: `wm.health.*`-compatible envelope (matches companion-degrade shape).
+    Digest {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
+        /// Minimum severity to include (default: include all).
+        #[arg(long, value_enum)]
+        severity: Option<SeverityFilter>,
+    },
     /// Sweep: auto-resolve stale open/escalated findings not seen in recent runs.
     ///
     /// Marks every open/escalated finding whose last_run differs from <run>
@@ -206,6 +219,20 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Command::Resolve { key, reason } => {
             let conn = db::open()?;
             db::resolve(&conn, &key, reason.as_deref())?;
+        }
+        Command::Digest { format, severity } => {
+            let min_sev = severity.as_ref().map(SeverityFilter::rank);
+            let conn = db::open()?;
+            let findings = db::list_active(&conn, min_sev)?;
+            let env = digest::compute(&findings);
+            match format {
+                Format::Json => {
+                    println!("{}", serde_json::to_string_pretty(&env)?);
+                }
+                Format::Text => {
+                    println!("{}", digest::format_text(&env));
+                }
+            }
         }
         Command::Sweep { run, stale_after } => {
             let stale = stale_after.unwrap_or_else(stale_after_default);

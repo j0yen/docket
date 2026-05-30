@@ -566,6 +566,31 @@ pub fn resolve(conn: &Connection, key: &str, reason: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// List findings in `open` or `escalated` state, applying an optional minimum
+/// severity filter.  Used by `docket digest`.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub fn list_active(conn: &Connection, min_severity: Option<u8>) -> Result<Vec<Finding>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM findings WHERE status IN ('open', 'escalated') ORDER BY runs_seen DESC",
+    )?;
+    let findings = stmt
+        .query_map([], row_to_finding)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(findings
+        .into_iter()
+        .filter(|f| {
+            min_severity.map_or(true, |min| {
+                Severity::from_str(&f.severity.to_string())
+                    .map_or(false, |s| s.rank() >= min)
+            })
+        })
+        .collect())
+}
+
 fn row_to_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<Finding> {
     let severity_str: String = row.get(2)?;
     let status_str: String = row.get(3)?;

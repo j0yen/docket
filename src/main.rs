@@ -11,6 +11,7 @@ use clap::Parser;
 
 mod cli;
 mod db;
+mod digest;
 mod error;
 mod model;
 
