@@ -105,16 +105,23 @@ pub struct DigestEnvelope {
 /// and to the caller's minimum severity. The function does not re-filter.
 #[must_use]
 pub fn compute(findings: &[Finding]) -> DigestEnvelope {
-    let open_count = findings.iter().filter(|f| f.status == Status::Open).count() as u64;
+    let open_count = u64::try_from(
+        findings.iter().filter(|f| f.status == Status::Open).count(),
+    )
+    .unwrap_or(u64::MAX);
     let escalated_findings: Vec<&Finding> = findings
         .iter()
         .filter(|f| f.status == Status::Escalated)
         .collect();
-    let escalated_count = escalated_findings.len() as u64;
-    let crit_count = findings
-        .iter()
-        .filter(|f| f.severity == Severity::Crit)
-        .count() as u64;
+    let escalated_count =
+        u64::try_from(escalated_findings.len()).unwrap_or(u64::MAX);
+    let crit_count = u64::try_from(
+        findings
+            .iter()
+            .filter(|f| f.severity == Severity::Crit)
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
 
     // Oldest by runs_seen desc, consecutive_runs as tiebreaker.
     let oldest = findings
@@ -122,7 +129,9 @@ pub fn compute(findings: &[Finding]) -> DigestEnvelope {
         .max_by_key(|f| (f.runs_seen, f.consecutive_runs));
 
     let oldest_key = oldest.map(|f| f.key.clone());
-    let oldest_runs = oldest.map_or(0, |f| f.runs_seen as u64);
+    let oldest_runs = oldest.map_or(0, |f| {
+        u64::try_from(f.runs_seen).unwrap_or(u64::MAX)
+    });
 
     let mut escalated_keys: Vec<String> =
         escalated_findings.iter().map(|f| f.key.clone()).collect();
@@ -245,6 +254,9 @@ mod tests {
             evidence: None,
             escalated_at: None,
             escalation_reason: None,
+            // M2: no evidence trail in unit tests
+            evidence_trail: Vec::new(),
+            evidence_count: 0,
         }
     }
 

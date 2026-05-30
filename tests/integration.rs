@@ -1002,3 +1002,318 @@ fn digest_no_escalated_graceful() {
     let keys = v["detail"]["escalated_keys"].as_array().expect("array");
     assert!(keys.is_empty(), "escalated_keys empty when no escalations: {v}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// docket-evidence acceptance criteria
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── evidence AC 1 — two --evidence refs create two typed rows ───────────────
+
+#[test]
+fn test_evidence_two_kinds_in_one_report() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let st = docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k",
+            "--title", "T",
+            "--evidence", "recall:01KSRV7R4FERPP40HQGV5RGZNT",
+            "--evidence", "pid:2138939",
+        ])
+        .status()
+        .expect("report");
+    assert!(st.success(), "report exit {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    assert!(out.status.success(), "show exit {:?}", out.status);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail array");
+    assert_eq!(trail.len(), 2, "expected 2 evidence rows: {v}");
+
+    let recall_row = trail.iter().find(|r| r["kind"] == "recall").expect("recall row");
+    assert_eq!(recall_row["ref_val"], "01KSRV7R4FERPP40HQGV5RGZNT", "{recall_row}");
+    assert_eq!(recall_row["run_id"], "r1", "{recall_row}");
+
+    let pid_row = trail.iter().find(|r| r["kind"] == "pid").expect("pid row");
+    assert_eq!(pid_row["ref_val"], "2138939", "{pid_row}");
+}
+
+// ── evidence AC 2 — second run appends; first-run rows are unchanged ─────────
+
+#[test]
+fn test_evidence_append_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // r1: two evidence refs
+    docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k",
+            "--title", "T",
+            "--evidence", "recall:01KSRV7R4FERPP40HQGV5RGZNT",
+            "--evidence", "pid:2138939",
+        ])
+        .status()
+        .expect("report r1");
+
+    // r2: one more evidence ref
+    docket(tmp.path())
+        .args([
+            "report", "--run", "r2", "--key", "k",
+            "--title", "T",
+            "--evidence", "provfs:1780026726",
+        ])
+        .status()
+        .expect("report r2");
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail");
+    assert_eq!(trail.len(), 3, "expected 3 evidence rows after r2: {v}");
+
+    // r1 rows must be unchanged
+    let r1_rows: Vec<_> = trail.iter().filter(|r| r["run_id"] == "r1").collect();
+    assert_eq!(r1_rows.len(), 2, "r1 should still have 2 rows: {v}");
+
+    // r2 row
+    let r2_rows: Vec<_> = trail.iter().filter(|r| r["run_id"] == "r2").collect();
+    assert_eq!(r2_rows.len(), 1, "r2 should have 1 row: {v}");
+    assert_eq!(r2_rows[0]["kind"], "provfs", "{}", r2_rows[0]);
+    assert_eq!(r2_rows[0]["ref_val"], "1780026726", "{}", r2_rows[0]);
+}
+
+// ── evidence AC 3 — unknown prefix stored as kind=raw ───────────────────────
+
+#[test]
+fn test_evidence_unknown_prefix_stored_as_raw() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let st = docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k",
+            "--title", "T",
+            "--evidence", "somethingweird",
+        ])
+        .status()
+        .expect("report");
+    assert!(st.success(), "report should succeed for unknown prefix: {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail");
+    assert_eq!(trail.len(), 1, "one row: {v}");
+    assert_eq!(trail[0]["kind"], "raw", "kind should be raw: {v}");
+    assert_eq!(trail[0]["ref_val"], "somethingweird", "{v}");
+}
+
+// ── evidence AC 4 — text output renders Evidence section ────────────────────
+
+#[test]
+fn test_evidence_text_output_has_evidence_section() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k",
+            "--title", "T",
+            "--evidence", "recall:01KSRV7R4FERPP40HQGV5RGZNT",
+            "--evidence", "pid:2138939",
+        ])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["show", "k"])
+        .output()
+        .expect("show text");
+    assert!(out.status.success(), "show exit {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Evidence"), "text output should contain 'Evidence': {text}");
+    assert!(text.contains("recall"), "text output should contain 'recall': {text}");
+    assert!(text.contains("01KSRV7R4FERPP40HQGV5RGZNT"), "text output should contain the ULID: {text}");
+    assert!(text.contains("[r1]"), "text output should contain run_id: {text}");
+}
+
+// ── evidence AC 5 — show json has evidence array; list json has evidence_count
+
+#[test]
+fn test_evidence_json_fields() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k",
+            "--title", "T",
+            "--evidence", "recall:AAAA",
+            "--evidence", "pid:123",
+            "--evidence", "commit:abc1234",
+        ])
+        .status()
+        .expect("report");
+
+    // show json: evidence_trail length == 3
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail");
+    assert_eq!(trail.len(), 3, "show json evidence_trail length: {v}");
+
+    // list json: evidence_count == 3
+    let out = docket(tmp.path())
+        .args(["list", "--format", "json"])
+        .output()
+        .expect("list json");
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let entry = arr.as_array().unwrap().iter().find(|f| f["key"] == "k").expect("k in list");
+    assert_eq!(entry["evidence_count"], 3, "list json evidence_count: {arr}");
+}
+
+// ── evidence AC 6 — N --evidence flags in one report yield N rows ────────────
+
+#[test]
+fn test_evidence_repeatable_n_flags() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k", "--title", "T",
+            "--evidence", "recall:A",
+            "--evidence", "pid:1",
+            "--evidence", "path:/foo",
+            "--evidence", "journal:2026-05-29",
+            "--evidence", "provfs:123",
+        ])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail");
+    assert_eq!(trail.len(), 5, "5 evidence refs → 5 rows: {v}");
+}
+
+// ── evidence AC 7 — malformed recall ULID stored; report exits 0 ────────────
+
+#[test]
+fn test_evidence_malformed_recall_stored_not_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let st = docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k", "--title", "T",
+            "--evidence", "recall:NOT-A-VALID-ULID",
+        ])
+        .status()
+        .expect("report");
+    // Must exit 0 — malformed refs are never rejected
+    assert!(st.success(), "malformed recall ref must not cause nonzero exit: {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail");
+    assert_eq!(trail.len(), 1, "malformed ULID should still be stored: {v}");
+    assert_eq!(trail[0]["kind"], "recall", "kind=recall even for malformed ULID: {v}");
+    assert_eq!(trail[0]["ref_val"], "NOT-A-VALID-ULID", "{v}");
+}
+
+// ── evidence AC 8 — migration adds evidence table idempotently ───────────────
+
+#[test]
+fn test_evidence_migration_idempotent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Three separate process invocations — migration runs each time, must be idempotent.
+    for run in &["r1", "r2", "r3"] {
+        let st = docket(tmp.path())
+            .args([
+                "report", "--run", run, "--key", "k", "--title", "T",
+                "--evidence", &format!("pid:{run}"),
+            ])
+            .status()
+            .expect("report");
+        assert!(st.success(), "idempotent migration run {run}: {:?}", st);
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("evidence_trail");
+    assert_eq!(trail.len(), 3, "3 evidence rows after 3 reports: {v}");
+}
+
+// ── evidence AC 9 — JSON outputs are jq-parseable with new evidence fields ───
+
+#[test]
+fn test_evidence_json_valid_jq() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args([
+            "report", "--run", "r1", "--key", "k", "--title", "T",
+            "--evidence", "recall:ULID123",
+            "--evidence", "journal:2026-05-29#7",
+        ])
+        .status()
+        .expect("report");
+
+    // Validate both JSON outputs parse cleanly
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show json");
+    let _: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("show --format json must be valid JSON");
+
+    let out = docket(tmp.path())
+        .args(["list", "--format", "json"])
+        .output()
+        .expect("list json");
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("list --format json must be valid JSON");
+    assert!(arr.is_array(), "list json is an array");
+}
+
+// ── evidence — chronological order (by run) ──────────────────────────────────
+
+#[test]
+fn test_evidence_chronological_by_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Report across three runs with one evidence ref each
+    for (run, ev) in &[("r1", "pid:1"), ("r2", "pid:2"), ("r3", "pid:3")] {
+        docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T", "--evidence", ev])
+            .status()
+            .expect("report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let trail = v["evidence_trail"].as_array().expect("trail");
+    assert_eq!(trail.len(), 3, "{v}");
+    assert_eq!(trail[0]["run_id"], "r1", "first row is r1: {v}");
+    assert_eq!(trail[1]["run_id"], "r2", "second row is r2: {v}");
+    assert_eq!(trail[2]["run_id"], "r3", "third row is r3: {v}");
+}

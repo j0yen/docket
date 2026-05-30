@@ -1,4 +1,4 @@
-//! Database layer for docket — SQLite via rusqlite.
+//! Database layer for docket — `SQLite` via rusqlite.
 //!
 //! All mutations use `BEGIN IMMEDIATE` transactions for safe concurrent
 //! access in WAL mode.
@@ -9,7 +9,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{DocketError, Result};
-use crate::model::{Finding, RunEntry, Severity, Status};
+use crate::model::{EvidenceRow, Finding, Severity, Status, parse_evidence_ref};
 
 /// Open (or create) the docket database, applying migrations.
 ///
@@ -34,6 +34,7 @@ pub fn open() -> Result<Connection> {
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or migrated.
+#[allow(dead_code)]
 pub fn open_at(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -63,7 +64,9 @@ fn db_path() -> Result<PathBuf> {
 /// Migration M1 (docket-escalate): `escalated_at`, `escalation_reason`
 ///   columns + `runs` ledger table.  Uses `ALTER TABLE … ADD COLUMN IF NOT
 ///   EXISTS` semantics via a SELECT-from-pragma guard to stay compatible with
-///   SQLite < 3.37 (which lacks IF NOT EXISTS on ADD COLUMN).
+///   `SQLite` < 3.37 (which lacks IF NOT EXISTS on ADD COLUMN).
+/// Migration M2 (docket-evidence): `evidence` append-only table for typed
+///   evidence refs keyed to findings.
 fn migrate(conn: &Connection) -> Result<()> {
     // M0: core findings table.
     conn.execute_batch(
@@ -98,6 +101,19 @@ fn migrate(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // M2: typed evidence trail — append-only, FK to findings.key.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS evidence (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            key     TEXT NOT NULL REFERENCES findings(key),
+            run_id  TEXT NOT NULL,
+            kind    TEXT NOT NULL,
+            ref_val TEXT NOT NULL,
+            note    TEXT,
+            seen_at TEXT NOT NULL
+        );",
+    )?;
+
     Ok(())
 }
 
@@ -113,7 +129,7 @@ fn add_column_if_missing(
         conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = stmt
         .query_map([], |row| row.get::<_, String>(1))?
-        .any(|r| r.map_or(false, |name| name == column));
+        .any(|r| r.is_ok_and(|name| name == column));
     if !exists {
         conn.execute_batch(&format!(
             "ALTER TABLE {table} ADD COLUMN {column} {col_type};"
@@ -122,55 +138,77 @@ fn add_column_if_missing(
     Ok(())
 }
 
-/// Record a run-id in the `runs` ledger (idempotent: same run-id not
-/// duplicated).  Returns the `seq` for this run-id.
+
+/// Insert one or more typed evidence refs for a finding (M2).
+///
+/// Each raw ref string in `refs` is parsed by prefix into `(kind, ref_val)`.
+/// Parsing is lenient — malformed refs are stored as kind `raw`.
+/// Never fails for bad ref syntax; only returns `Err` on DB error.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub fn record_run(conn: &Connection, run_id: &str) -> Result<i64> {
-    let now = Utc::now().to_rfc3339();
-    // Check if already recorded.
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT seq FROM runs WHERE run_id = ?1",
-            params![run_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(seq) = existing {
-        return Ok(seq);
+pub fn insert_evidence(
+    conn: &Connection,
+    key: &str,
+    run_id: &str,
+    refs: &[String],
+) -> Result<()> {
+    if refs.is_empty() {
+        return Ok(());
     }
-    // Insert with seq = MAX(seq)+1.
-    let next_seq: i64 = conn
-        .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM runs", [], |row| {
-            row.get(0)
-        })?;
-    conn.execute(
-        "INSERT INTO runs (run_id, seq, seen_at) VALUES (?1, ?2, ?3)",
-        params![run_id, next_seq, now],
-    )?;
-    Ok(next_seq)
+    let now = Utc::now().to_rfc3339();
+    for raw in refs {
+        let (kind, ref_val) = parse_evidence_ref(raw);
+        conn.execute(
+            "INSERT INTO evidence (key, run_id, kind, ref_val, note, seen_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![key, run_id, kind, ref_val, now],
+        )?;
+    }
+    Ok(())
 }
 
-/// List all run ledger entries in arrival order.
+/// List all evidence rows for a given finding key, ordered by insertion id.
 ///
 /// # Errors
 ///
 /// Returns an error if the database query fails.
-pub fn list_runs(conn: &Connection) -> Result<Vec<RunEntry>> {
-    let mut stmt = conn.prepare("SELECT run_id, seq, seen_at FROM runs ORDER BY seq ASC")?;
-    let entries = stmt
-        .query_map([], |row| {
-            Ok(RunEntry {
-                run_id: row.get(0)?,
-                seq: row.get(1)?,
-                seen_at: row.get(2)?,
+pub fn list_evidence(conn: &Connection, key: &str) -> Result<Vec<EvidenceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, key, run_id, kind, ref_val, note, seen_at
+         FROM evidence WHERE key = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![key], |row| {
+            Ok(EvidenceRow {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                run_id: row.get(2)?,
+                kind: row.get(3)?,
+                ref_val: row.get(4)?,
+                note: row.get(5)?,
+                seen_at: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(entries)
+    Ok(rows)
 }
+
+/// Count evidence rows for a given finding key.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub fn count_evidence(conn: &Connection, key: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM evidence WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 
 /// Report a finding.  Upserts by `key`.
 ///
@@ -186,6 +224,7 @@ pub fn list_runs(conn: &Connection) -> Result<Vec<RunEntry>> {
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn report(
     conn: &Connection,
     run_id: &str,
@@ -260,10 +299,10 @@ pub fn report(
             Some((status, last_run, runs_seen, consecutive_runs, _report_count)) => {
                 if status == "resolved" {
                     // Reopen: reset streak to 1, clear resolved fields.
-                    let new_runs = if run_id != last_run {
-                        runs_seen + 1
-                    } else {
+                    let new_runs = if run_id == last_run {
                         runs_seen
+                    } else {
+                        runs_seen + 1
                     };
                     // Reopened findings start open with streak 1.
                     let (new_status, esc_at, esc_reason) =
@@ -373,6 +412,7 @@ fn escalation_fields(
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
+#[allow(clippy::too_many_lines)]
 pub fn sweep(
     conn: &Connection,
     current_run_id: &str,
@@ -407,6 +447,9 @@ pub fn sweep(
         };
 
         // Gather open/escalated findings not seen in the current run.
+        // Note: the intermediate `rows` binding is required to satisfy the
+        // borrow checker — the stmt borrow must end before the block ends.
+        #[allow(clippy::let_and_return)]
         let candidates: Vec<(String, String, i64)> = {
             let mut stmt = conn.prepare(
                 "SELECT key, last_run, consecutive_runs FROM findings
@@ -502,6 +545,9 @@ pub struct SweepResult {
 /// `status_filter`: `"open"`, `"resolved"`, `"escalated"`, or `"all"`.
 /// `min_severity`: optional minimum severity rank (info=0, warn=1, crit=2).
 ///
+/// Populates `evidence_count` for each finding (cheap aggregate); the full
+/// `evidence_trail` is NOT populated here — use `show` for that.
+///
 /// # Errors
 ///
 /// Returns an error if the database query fails.
@@ -523,30 +569,41 @@ pub fn list(
         .query_map([], row_to_finding)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    Ok(findings
+    let mut result: Vec<Finding> = findings
         .into_iter()
         .filter(|f| {
-            min_severity.map_or(true, |min| {
+            min_severity.is_none_or(|min| {
                 Severity::from_str(&f.severity.to_string())
-                    .map_or(false, |s| s.rank() >= min)
+                    .is_some_and(|s| s.rank() >= min)
             })
         })
-        .collect())
+        .collect();
+
+    // Populate evidence_count for each finding via cheap aggregate.
+    for f in &mut result {
+        f.evidence_count = count_evidence(conn, &f.key)?;
+    }
+
+    Ok(result)
 }
 
-/// Retrieve a single finding by key.
+/// Retrieve a single finding by key, including its full typed evidence trail.
 ///
 /// # Errors
 ///
 /// Returns `DocketError::NotFound` if the key does not exist.
 pub fn show(conn: &Connection, key: &str) -> Result<Finding> {
-    conn.query_row(
-        "SELECT * FROM findings WHERE key = ?1",
-        params![key],
-        row_to_finding,
-    )
-    .optional()?
-    .ok_or_else(|| DocketError::NotFound(key.to_owned()))
+    let mut finding = conn
+        .query_row(
+            "SELECT * FROM findings WHERE key = ?1",
+            params![key],
+            row_to_finding,
+        )
+        .optional()?
+        .ok_or_else(|| DocketError::NotFound(key.to_owned()))?;
+    // Populate the typed evidence trail (M2).
+    finding.evidence_trail = list_evidence(conn, key)?;
+    Ok(finding)
 }
 
 /// Resolve a finding.
@@ -583,9 +640,9 @@ pub fn list_active(conn: &Connection, min_severity: Option<u8>) -> Result<Vec<Fi
     Ok(findings
         .into_iter()
         .filter(|f| {
-            min_severity.map_or(true, |min| {
+            min_severity.is_none_or(|min| {
                 Severity::from_str(&f.severity.to_string())
-                    .map_or(false, |s| s.rank() >= min)
+                    .is_some_and(|s| s.rank() >= min)
             })
         })
         .collect())
@@ -630,5 +687,8 @@ fn row_to_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<Finding> {
         evidence: row.get(13)?,
         escalated_at,
         escalation_reason,
+        // evidence_trail and evidence_count are populated by show/list after row mapping.
+        evidence_trail: Vec::new(),
+        evidence_count: 0,
     })
 }

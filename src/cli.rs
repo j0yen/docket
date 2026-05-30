@@ -64,11 +64,15 @@ pub(crate) enum Command {
         /// Severity level (default: warn).
         #[arg(long, default_value = "warn")]
         severity: String,
-        /// Optional evidence reference (raw string, stored for future docket-evidence).
-        #[arg(long)]
-        evidence: Option<String>,
+        /// Typed evidence reference(s) — repeatable.
+        ///
+        /// Format: `<kind>:<ref>`.  Known kinds: `recall`, `journal`, `pid`,
+        /// `provfs`, `commit`, `path`.  Unknown prefixes stored as `raw`.
+        /// Malformed refs are never rejected — they are stored as-given.
+        #[arg(long, action = clap::ArgAction::Append)]
+        evidence: Vec<String>,
         /// Escalation threshold: escalate after this many consecutive runs.
-        /// Overrides DOCKET_ESCALATE_THRESHOLD env var (default 3).
+        /// Overrides `DOCKET_ESCALATE_THRESHOLD` env var (default 3).
         #[arg(long)]
         escalate_threshold: Option<i64>,
     },
@@ -111,7 +115,7 @@ pub(crate) enum Command {
     },
     /// Digest: compact rollup of open/escalated findings for banners and health checks.
     ///
-    /// Text output (default): ≤3-line banner safe to inline in SessionStart.
+    /// Text output (default): ≤3-line banner safe to inline in `SessionStart`.
     /// JSON output: `wm.health.*`-compatible envelope (matches companion-degrade shape).
     Digest {
         /// Output format.
@@ -123,15 +127,15 @@ pub(crate) enum Command {
     },
     /// Sweep: auto-resolve stale open/escalated findings not seen in recent runs.
     ///
-    /// Marks every open/escalated finding whose last_run differs from <run>
-    /// and whose absence spans >= stale_after runs as resolved(stale).
-    /// Also resets consecutive_runs to 0 for findings with a gap (< stale_after).
+    /// Marks every open/escalated finding whose `last_run` differs from <run>
+    /// and whose absence spans >= `stale_after` runs as resolved(stale).
+    /// Also resets `consecutive_runs` to 0 for findings with a gap (< `stale_after`).
     Sweep {
         /// Current run identifier (will be recorded in the runs ledger).
         #[arg(long)]
         run: String,
         /// Number of elapsed runs before a finding is considered stale.
-        /// Overrides DOCKET_STALE_AFTER env var (default 3).
+        /// Overrides `DOCKET_STALE_AFTER` env var (default 3).
         #[arg(long)]
         stale_after: Option<i64>,
     },
@@ -158,6 +162,7 @@ fn stale_after_default() -> i64 {
 /// # Errors
 ///
 /// Returns an error if the database operation fails or a key is not found.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Report {
@@ -170,7 +175,13 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         } => {
             let threshold = escalate_threshold.unwrap_or_else(escalate_threshold_default);
             let conn = db::open()?;
-            db::report(&conn, &run, &key, &title, &severity, evidence.as_deref(), threshold)?;
+            // Pass None for the legacy single-line evidence column; typed refs go
+            // into the `evidence` table via insert_evidence.
+            db::report(&conn, &run, &key, &title, &severity, None, threshold)?;
+            // Append typed evidence refs (M2) — lenient, never fails for bad syntax.
+            if !evidence.is_empty() {
+                db::insert_evidence(&conn, &key, &run, &evidence)?;
+            }
         }
         Command::List {
             open: _open,
