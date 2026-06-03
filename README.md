@@ -197,6 +197,80 @@ docket show agorabus-stale-binary --format json | jq '.evidence_trail[] | "\(.ru
 docket list --format json | jq '.[] | "\(.key): \(.evidence_count) evidence refs"'
 ```
 
+## digest
+
+`docket digest` produces a compact rollup of the open/escalated finding set — one line for
+a SessionStart banner, or a `wm.health.*`-compatible JSON envelope for machine consumers.
+
+```sh
+docket digest [--format text|json] [--severity info|warn|crit]
+```
+
+- **text** (default): a one-to-three line summary safe to inline in a banner.
+  Empty store → single clean line, exit 0.
+  ```
+  docket: 4 open (1 crit), 1 escalated · oldest: agorabus-stale-binary (12 runs)
+    escalated: agorabus-stale-binary — recurred 3+ runs, durable handling justified
+  ```
+- **json**: a `wm.health.*` envelope (see "Status mapping" below).
+  ```json
+  {
+    "component": "docket",
+    "status": "degraded",
+    "summary": "4 open, 1 escalated",
+    "detail": {
+      "open": 4, "escalated": 1, "crit": 1,
+      "oldest_key": "agorabus-stale-binary", "oldest_runs": 12,
+      "escalated_keys": ["agorabus-stale-binary"]
+    }
+  }
+  ```
+- **`--severity <min>`**: exclude findings below the specified severity from all counts and
+  summary output (e.g. `--severity warn` excludes `info`-severity findings).
+
+### Status mapping
+
+The `wm.health.*` envelope `status` field is determined as follows:
+
+| Condition                              | `status`   |
+|----------------------------------------|------------|
+| no findings (empty store)              | `ok`       |
+| open findings only, none escalated     | `ok`       |
+| any escalated findings (non-crit)      | `degraded` |
+| any escalated finding with `crit` severity | `down` |
+
+**Oldest finding** is selected by `consecutive_runs` (run-age), not wall-clock time.
+The selection is stable across `--format text` vs `--format json`.
+
+### `wm.health.*` envelope — source of truth
+
+The `wm.health.*` envelope schema is **owned by companion-degrade** and consumed by
+vision-kin's health digest and homestead's readiness-beacon. `docket digest --format json`
+reuses that exact field shape; it does **not** define a parallel envelope.
+
+If companion-degrade ships a Rust crate/type for the envelope, `docket` will depend on it.
+Until then, field names are matched exactly to companion-degrade's published JSON contract
+and a test asserts conformance.
+
+### SessionStart hook snippet
+
+The following shows how to wire `docket digest` into a SessionStart banner.
+**This is documented for user reference only — this PRD does NOT modify the live hook.**
+Uncomment and add to your SessionStart hook script when ready:
+
+```sh
+# --- docket digest (add to SessionStart hook) ---
+# _docket_digest=$(docket digest --format text 2>/dev/null)
+# if [ -n "$_docket_digest" ]; then
+#   echo "$_docket_digest"
+# fi
+# -------------------------------------------------
+```
+
+Integrating this adds one-to-three lines to the banner showing open/escalated finding counts,
+the oldest finding's run-age, and any escalated keys — identical information to what
+`docket list` shows, collapsed to banner-safe width.
+
 ## License
 
 MIT OR Apache-2.0
