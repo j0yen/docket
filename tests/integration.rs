@@ -49,7 +49,7 @@ fn test_help_lists_subcommands() {
         .expect("docket --help");
     assert!(out.status.success(), "exit {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for sub in &["report", "list", "show", "resolve", "sweep", "digest"] {
+    for sub in &["report", "list", "show", "resolve", "sweep", "digest", "ack", "unack"] {
         assert!(
             stdout.contains(sub),
             "help output missing subcommand '{sub}': {stdout}"
@@ -1316,4 +1316,411 @@ fn test_evidence_chronological_by_run() {
     assert_eq!(trail[0]["run_id"], "r1", "first row is r1: {v}");
     assert_eq!(trail[1]["run_id"], "r2", "second row is r2: {v}");
     assert_eq!(trail[2]["run_id"], "r3", "third row is r3: {v}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// abide-ack-state acceptance criteria
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── ack AC 1 — migration is additive and idempotent ──────────────────────────
+
+#[test]
+fn ack_migration_idempotent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Two separate process invocations — migration runs twice.
+    for run in &["r1", "r2"] {
+        let st = docket(tmp.path())
+            .args(["report", "--run", run, "--key", "k", "--title", "T"])
+            .status()
+            .expect("report");
+        assert!(st.success(), "migration idempotent run {run}: {:?}", st);
+    }
+
+    // Third invocation: list — must also succeed.
+    let st = docket(tmp.path())
+        .args(["list", "--format", "json"])
+        .status()
+        .expect("list");
+    assert!(st.success(), "list after repeated opens: {:?}", st);
+}
+
+// ── ack AC 2 — docket ack sets ack columns; status/runs_seen unchanged ────────
+
+#[test]
+fn ack_sets_columns_status_unchanged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    let st = docket(tmp.path())
+        .args(["ack", "k", "--reason", "triaged", "--until-change", "pkgrel:5"])
+        .status()
+        .expect("ack");
+    assert!(st.success(), "ack exit {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+
+    assert!(!v["acknowledged_at"].is_null(), "acknowledged_at set: {v}");
+    assert_eq!(v["ack_reason"], "triaged", "{v}");
+    assert_eq!(v["ack_fingerprint"], "pkgrel:5", "{v}");
+    // Status and runs_seen must be unchanged.
+    assert_eq!(v["status"], "open", "status unchanged: {v}");
+    assert_eq!(v["runs_seen"], 1, "runs_seen unchanged: {v}");
+    assert_eq!(v["consecutive_runs"], 1, "consecutive_runs unchanged: {v}");
+}
+
+// ── ack AC 3 — ack errors on unknown or resolved key ─────────────────────────
+
+#[test]
+fn ack_errors_on_unknown_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = docket(tmp.path())
+        .args(["ack", "no-such-key"])
+        .output()
+        .expect("ack unknown");
+    assert!(!out.status.success(), "should fail for unknown key");
+}
+
+#[test]
+fn ack_errors_on_resolved_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["resolve", "k"])
+        .status()
+        .expect("resolve");
+
+    let out = docket(tmp.path())
+        .args(["ack", "k"])
+        .output()
+        .expect("ack resolved");
+    assert!(!out.status.success(), "should fail for resolved key");
+}
+
+// ── ack AC 4 — unack clears columns; non-acked unack is no-op ────────────────
+
+#[test]
+fn unack_clears_columns() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["ack", "k", "--reason", "R"])
+        .status()
+        .expect("ack");
+
+    let st = docket(tmp.path())
+        .args(["unack", "k"])
+        .status()
+        .expect("unack");
+    assert!(st.success(), "unack exit {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(v["acknowledged_at"].is_null(), "acknowledged_at cleared: {v}");
+    assert!(v["ack_reason"].is_null(), "ack_reason cleared: {v}");
+    assert!(v["ack_fingerprint"].is_null(), "ack_fingerprint cleared: {v}");
+    // Other fields must be intact.
+    assert_eq!(v["status"], "open", "status intact: {v}");
+    assert_eq!(v["runs_seen"], 1, "runs_seen intact: {v}");
+}
+
+#[test]
+fn unack_noop_on_non_acked() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    // unack of a non-acked finding must exit 0
+    let out = docket(tmp.path())
+        .args(["unack", "k"])
+        .output()
+        .expect("unack");
+    assert!(out.status.success(), "unack non-acked must exit 0: {:?}", out.status);
+}
+
+// ── ack AC 5 — same fingerprint keeps the ack ────────────────────────────────
+
+#[test]
+fn report_same_fingerprint_keeps_ack() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["ack", "k", "--until-change", "pkgrel:5"])
+        .status()
+        .expect("ack");
+
+    // Report with the SAME fingerprint — ack must persist.
+    let st = docket(tmp.path())
+        .args(["report", "--run", "r2", "--key", "k", "--title", "T", "--fingerprint", "pkgrel:5"])
+        .status()
+        .expect("report r2");
+    assert!(st.success(), "report exit {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(!v["acknowledged_at"].is_null(), "ack kept with same fp: {v}");
+}
+
+// ── ack AC 6 — changed fingerprint clears the ack ────────────────────────────
+
+#[test]
+fn report_changed_fingerprint_clears_ack() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["ack", "k", "--until-change", "pkgrel:5"])
+        .status()
+        .expect("ack");
+
+    // Report with a DIFFERENT fingerprint — ack must be cleared.
+    let st = docket(tmp.path())
+        .args(["report", "--run", "r2", "--key", "k", "--title", "T", "--fingerprint", "pkgrel:11"])
+        .status()
+        .expect("report r2");
+    assert!(st.success(), "report exit {:?}", st);
+
+    let out = docket(tmp.path())
+        .args(["show", "k", "--format", "json"])
+        .output()
+        .expect("show");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(v["acknowledged_at"].is_null(), "ack cleared on fp change: {v}");
+    assert_eq!(v["runs_seen"], 2, "runs_seen still increments: {v}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// abide-digest-quiet acceptance criteria
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── digest-quiet AC 1 — acked findings excluded from default list ─────────────
+
+#[test]
+fn digest_quiet_list_excludes_acked() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "open1", "--title", "Open"])
+        .status()
+        .expect("report open1");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "acked1", "--title", "Acked"])
+        .status()
+        .expect("report acked1");
+    docket(tmp.path())
+        .args(["ack", "acked1"])
+        .status()
+        .expect("ack acked1");
+
+    // Default list --open: should show only open1
+    let out = docket(tmp.path())
+        .args(["list", "--open", "--format", "json"])
+        .output()
+        .expect("list open");
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let arr = arr.as_array().expect("array");
+    assert!(arr.iter().any(|f| f["key"] == "open1"), "open1 in list: {arr:?}");
+    assert!(!arr.iter().any(|f| f["key"] == "acked1"), "acked1 excluded by default: {arr:?}");
+
+    // --include-acked: both visible
+    let out = docket(tmp.path())
+        .args(["list", "--open", "--include-acked", "--format", "json"])
+        .output()
+        .expect("list open --include-acked");
+    let arr2: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let arr2 = arr2.as_array().expect("array");
+    assert!(arr2.iter().any(|f| f["key"] == "open1"), "open1 visible with --include-acked: {arr2:?}");
+    assert!(arr2.iter().any(|f| f["key"] == "acked1"), "acked1 visible with --include-acked: {arr2:?}");
+}
+
+// ── digest-quiet AC 2 — digest excludes acked from open/escalated counts ──────
+
+#[test]
+fn digest_quiet_excludes_acked_from_counts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "open1", "--title", "Open"])
+        .status()
+        .expect("report open1");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "acked1", "--title", "Acked"])
+        .status()
+        .expect("report acked1");
+    docket(tmp.path())
+        .args(["ack", "acked1"])
+        .status()
+        .expect("ack acked1");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["detail"]["open"], 1, "only 1 non-acked open: {v}");
+    assert_eq!(v["detail"]["escalated"], 0, "0 escalated: {v}");
+}
+
+// ── digest-quiet AC 3 — DigestDetail.acked count correct ─────────────────────
+
+#[test]
+fn digest_quiet_acked_count_correct() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "open1", "--title", "Open"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "acked1", "--title", "Acked"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["ack", "acked1"])
+        .status()
+        .expect("ack");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["detail"]["acked"], 1, "acked count == 1: {v}");
+}
+
+// ── digest-quiet AC 4 — summary includes acked clause when non-zero ───────────
+
+#[test]
+fn digest_quiet_summary_includes_acked_clause() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "open1", "--title", "Open"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "acked1", "--title", "Acked"])
+        .status()
+        .expect("report");
+    docket(tmp.path())
+        .args(["ack", "acked1"])
+        .status()
+        .expect("ack");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let summary = v["summary"].as_str().unwrap_or("");
+    assert!(summary.contains("1 acked"), "summary should contain '1 acked': {v}");
+}
+
+// ── digest-quiet AC 5 — acked escalated finding → HealthStatus::Ok ───────────
+
+#[test]
+fn digest_quiet_acked_escalated_is_ok() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Escalate a finding (3 runs).
+    for r in 1..=3_i32 {
+        docket(tmp.path())
+            .args(["report", "--run", &format!("r{r}"), "--key", "esc", "--title", "E"])
+            .status()
+            .expect("report esc");
+    }
+
+    // Ack it.
+    docket(tmp.path())
+        .args(["ack", "esc"])
+        .status()
+        .expect("ack esc");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "ok", "acked escalated should be ok: {v}");
+}
+
+// ── digest-quiet AC 6 — --include-acked restores prior behaviour ──────────────
+
+#[test]
+fn digest_quiet_include_acked_restores_counts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    for r in 1..=3_i32 {
+        docket(tmp.path())
+            .args(["report", "--run", &format!("r{r}"), "--key", "esc", "--title", "E"])
+            .status()
+            .expect("report esc");
+    }
+    docket(tmp.path())
+        .args(["ack", "esc"])
+        .status()
+        .expect("ack esc");
+
+    // --include-acked: should show status=degraded (acked finding counted)
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json", "--include-acked"])
+        .output()
+        .expect("digest json --include-acked");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["status"], "degraded", "--include-acked restores degraded: {v}");
+    assert_eq!(v["detail"]["escalated"], 1, "--include-acked counts escalated: {v}");
+}
+
+// ── digest-quiet AC 7 — existing tests green with zero acked ─────────────────
+
+#[test]
+fn digest_quiet_zero_acked_backward_compat_summary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    docket(tmp.path())
+        .args(["report", "--run", "r1", "--key", "k", "--title", "T"])
+        .status()
+        .expect("report");
+
+    let out = docket(tmp.path())
+        .args(["digest", "--format", "json"])
+        .output()
+        .expect("digest json");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let summary = v["summary"].as_str().unwrap_or("");
+    // With zero acked, summary must NOT have ", 0 acked"
+    assert!(!summary.contains("acked"), "zero-acked summary must not mention acked: {v}");
+    assert_eq!(summary, "1 open", "zero-acked summary byte-identical: {v}");
 }
