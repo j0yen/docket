@@ -181,6 +181,29 @@ pub(crate) enum Command {
         #[arg(long)]
         stale_after: Option<i64>,
     },
+    /// List probe-suspect findings: open findings with high report+run counts that
+    /// were never resolved.  Useful for identifying probes that may be reporting
+    /// phantom issues or need logic review.
+    ///
+    /// Excludes acked findings by default; use `--include-acked` to see them.
+    /// Excludes resolved findings (always).
+    Stuck {
+        /// Minimum report_count threshold (default 6).
+        #[arg(long, default_value = "6")]
+        min_reports: i64,
+        /// Minimum runs_seen threshold (default 5).
+        #[arg(long, default_value = "5")]
+        min_runs: i64,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
+        /// Filter to findings whose key contains this substring.
+        #[arg(long)]
+        key: Option<String>,
+        /// Include acknowledged findings (excluded by default).
+        #[arg(long)]
+        include_acked: bool,
+    },
 }
 
 /// Resolve `DOCKET_ESCALATE_THRESHOLD` env var, defaulting to 3.
@@ -344,6 +367,56 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
                 "sweep complete: resolved={} streak_reset={}",
                 result.resolved, result.streak_reset
             );
+        }
+        Command::Stuck {
+            min_reports,
+            min_runs,
+            format,
+            key,
+            include_acked,
+        } => {
+            let conn = db::open()?;
+            let findings = db::stuck(&conn, min_reports, min_runs, key.as_deref(), include_acked)?;
+            if findings.is_empty() {
+                println!("no probe-suspect findings");
+                return Ok(());
+            }
+            match format {
+                Format::Json => {
+                    let rows: Vec<serde_json::Value> = findings
+                        .iter()
+                        .map(|f| {
+                            let reason = format!(
+                                "reported {report_count}\u{00d7} over {runs_seen} runs, \
+                                 never resolved \u{2014} verify the probe matches reality \
+                                 before re-parking",
+                                report_count = f.report_count,
+                                runs_seen = f.runs_seen,
+                            );
+                            serde_json::json!({
+                                "key": f.key,
+                                "title": f.title,
+                                "report_count": f.report_count,
+                                "runs_seen": f.runs_seen,
+                                "consecutive_runs": f.consecutive_runs,
+                                "first_seen": f.first_seen,
+                                "last_seen": f.last_seen,
+                                "suspect_reason": reason,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                Format::Text => {
+                    for f in &findings {
+                        let ack_marker = if f.is_acked() { " (acked)" } else { "" };
+                        println!(
+                            "[suspect] {} — {} reports / {} runs{ack_marker}\n  {}",
+                            f.key, f.report_count, f.runs_seen, f.title,
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())

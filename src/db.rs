@@ -774,6 +774,47 @@ pub fn resolve(conn: &Connection, key: &str, reason: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// List probe-suspect findings: open (or escalated) findings whose
+/// `report_count >= min_reports` AND `runs_seen >= min_runs` AND
+/// `resolved_at IS NULL`.  Acked findings are excluded by default.
+///
+/// An optional `key_substr` filter restricts results to findings whose key
+/// contains the given substring (case-sensitive).
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub fn stuck(
+    conn: &Connection,
+    min_reports: i64,
+    min_runs: i64,
+    key_substr: Option<&str>,
+    include_acked: bool,
+) -> Result<Vec<Finding>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM findings
+         WHERE resolved_at IS NULL
+           AND report_count >= ?1
+           AND runs_seen >= ?2
+         ORDER BY report_count DESC, runs_seen DESC",
+    )?;
+    let findings = stmt
+        .query_map(params![min_reports, min_runs], row_to_finding)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let result: Vec<Finding> = findings
+        .into_iter()
+        .filter(|f| {
+            let acked_ok = include_acked || !f.is_acked();
+            let key_ok = key_substr
+                .map_or(true, |sub| f.key.contains(sub));
+            acked_ok && key_ok
+        })
+        .collect();
+
+    Ok(result)
+}
+
 /// List findings in `open` or `escalated` state, applying an optional minimum
 /// severity filter.  Used by `docket digest`.
 ///

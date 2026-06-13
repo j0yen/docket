@@ -1724,3 +1724,217 @@ fn digest_quiet_zero_acked_backward_compat_summary() {
     assert!(!summary.contains("acked"), "zero-acked summary must not mention acked: {v}");
     assert_eq!(summary, "1 open", "zero-acked summary byte-identical: {v}");
 }
+
+// ── litmus-stuck-detector ACs ─────────────────────────────────────────────────
+
+/// Seed a finding with many reports across many runs. Returns the tmp dir.
+fn seed_stuck_finding(tmp: &std::path::Path, key: &str, runs: u32, reports_per_run: u32) {
+    for r in 0..runs {
+        let run_id = format!("r{r}");
+        for _ in 0..reports_per_run {
+            docket(tmp)
+                .args([
+                    "report",
+                    "--run",
+                    &run_id,
+                    "--key",
+                    key,
+                    "--title",
+                    "Probe never clears",
+                ])
+                .status()
+                .expect("report");
+        }
+    }
+}
+
+// AC 1 — basic stuck listing: open findings with report_count>=6 AND runs_seen>=5
+#[test]
+fn stuck_ac1_lists_qualifying_open_findings() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Seed: 12 reports across 10 runs (qualifies for default thresholds 6/5)
+    seed_stuck_finding(tmp.path(), "ctrace-phantom", 10, 1);
+    // Add extra reports on run r0 to push report_count to 12
+    for _ in 0..2 {
+        docket(tmp.path())
+            .args(["report", "--run", "r0", "--key", "ctrace-phantom", "--title", "Probe never clears"])
+            .status()
+            .expect("extra report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["stuck"])
+        .output()
+        .expect("docket stuck");
+    assert!(out.status.success(), "exit {:?}\nstderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ctrace-phantom"), "should list ctrace-phantom: {stdout}");
+    assert!(!stdout.contains("no probe-suspect findings"), "should not be empty: {stdout}");
+}
+
+// AC 2 — end-to-end: appears in stuck, disappears after resolve
+#[test]
+fn stuck_ac2_disappears_after_resolve() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_stuck_finding(tmp.path(), "ctrace-like", 10, 1);
+    // add 2 more to hit report_count=12
+    for _ in 0..2 {
+        docket(tmp.path())
+            .args(["report", "--run", "r0", "--key", "ctrace-like", "--title", "Probe never clears"])
+            .status()
+            .expect("extra report");
+    }
+
+    // Verify appears
+    let out = docket(tmp.path())
+        .args(["stuck"])
+        .output()
+        .expect("stuck before resolve");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ctrace-like"));
+
+    // Resolve
+    docket(tmp.path())
+        .args(["resolve", "ctrace-like"])
+        .status()
+        .expect("resolve");
+
+    // Verify disappears
+    let out2 = docket(tmp.path())
+        .args(["stuck"])
+        .output()
+        .expect("stuck after resolve");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(!stdout2.contains("ctrace-like"), "resolved finding should not appear: {stdout2}");
+    assert!(stdout2.contains("no probe-suspect findings"), "should be empty after resolve: {stdout2}");
+}
+
+// AC 3 — --min-reports / --min-runs flags change the cutoff
+#[test]
+fn stuck_ac3_cutoff_flags() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // 4 runs, 1 report each → report_count=4, runs_seen=4
+    seed_stuck_finding(tmp.path(), "borderline", 4, 1);
+
+    // default thresholds (6/5) → should NOT appear
+    let out = docket(tmp.path())
+        .args(["stuck"])
+        .output()
+        .expect("stuck default");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("borderline"), "should be below default threshold: {stdout}");
+
+    // lower thresholds → should appear
+    let out2 = docket(tmp.path())
+        .args(["stuck", "--min-reports", "3", "--min-runs", "3"])
+        .output()
+        .expect("stuck lower threshold");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("borderline"), "should appear at lower threshold: {stdout2}");
+}
+
+// AC 4 — --format json emits a valid JSON array with all documented fields
+#[test]
+fn stuck_ac4_json_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_stuck_finding(tmp.path(), "probe-json", 10, 1);
+    // push report_count to 12
+    for _ in 0..2 {
+        docket(tmp.path())
+            .args(["report", "--run", "r0", "--key", "probe-json", "--title", "JSON probe"])
+            .status()
+            .expect("extra report");
+    }
+
+    let out = docket(tmp.path())
+        .args(["stuck", "--format", "json"])
+        .output()
+        .expect("stuck --format json");
+    assert!(out.status.success(), "exit {:?}\nstderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert!(arr.is_array(), "should be JSON array");
+    let items = arr.as_array().expect("array");
+    assert!(!items.is_empty(), "array should be non-empty");
+
+    let item = &items[0];
+    for field in &["key", "title", "report_count", "runs_seen", "consecutive_runs", "first_seen", "last_seen", "suspect_reason"] {
+        assert!(item.get(field).is_some(), "JSON missing field '{field}': {item}");
+    }
+    assert!(item["suspect_reason"].as_str().unwrap_or("").contains("never resolved"),
+        "suspect_reason should mention 'never resolved': {item}");
+}
+
+// AC 5 — acked findings excluded by default, included with --include-acked
+#[test]
+fn stuck_ac5_acked_exclusion() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_stuck_finding(tmp.path(), "acked-probe", 10, 1);
+    // push report_count to 12
+    for _ in 0..2 {
+        docket(tmp.path())
+            .args(["report", "--run", "r0", "--key", "acked-probe", "--title", "Acked probe"])
+            .status()
+            .expect("extra report");
+    }
+
+    // Ack it
+    docket(tmp.path())
+        .args(["ack", "acked-probe"])
+        .status()
+        .expect("ack");
+
+    // Default: should be excluded
+    let out = docket(tmp.path())
+        .args(["stuck"])
+        .output()
+        .expect("stuck default");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("acked-probe"), "acked finding should be excluded by default: {stdout}");
+
+    // --include-acked: should appear
+    let out2 = docket(tmp.path())
+        .args(["stuck", "--include-acked"])
+        .output()
+        .expect("stuck --include-acked");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("acked-probe"), "acked finding should appear with --include-acked: {stdout2}");
+}
+
+// AC 6 — no db writes: byte-identical db before and after stuck
+#[test]
+fn stuck_ac6_no_db_writes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_stuck_finding(tmp.path(), "readonly-probe", 10, 1);
+
+    let db_path = tmp.path().join("docket").join("docket.db");
+    let before = std::fs::read(&db_path).expect("read db before");
+
+    // Run stuck (read-only)
+    let out = docket(tmp.path())
+        .args(["stuck"])
+        .output()
+        .expect("stuck");
+    assert!(out.status.success());
+
+    let after = std::fs::read(&db_path).expect("read db after");
+    assert_eq!(before, after, "docket stuck must not write to the database");
+}
+
+// AC 7 — help includes 'stuck' subcommand
+#[test]
+fn stuck_ac7_help_lists_stuck() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = docket(tmp.path())
+        .arg("--help")
+        .output()
+        .expect("docket --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("stuck"), "help output missing 'stuck' subcommand: {stdout}");
+}
