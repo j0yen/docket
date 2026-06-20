@@ -1,11 +1,22 @@
 # docket
 
-A structured ledger for standing findings. A finding reported twice is the same finding.
+A SQLite-backed ledger for standing findings. A finding reported twice is the same finding.
 
-`docket` is a small SQLite-backed CLI that deduplicates findings by a stable key, tracks
-first/last-seen timestamps, maintains a consecutive-run streak, and accumulates a typed
-**evidence trail** — so every run that observes a finding contributes its proof, and
-`docket show` renders the full chronological trail.
+Probes and self-review runs keep re-discovering the same problems. Logged naively, each run produces a fresh row, and the signal — *this has been broken for nine runs straight* — is lost in duplicates. `docket` collapses repeats onto a stable key and tracks the structure that actually matters: when the finding was first and last seen, how many consecutive runs it has survived, and the typed evidence each run contributed. A finding earns escalation by recurring, gets auto-resolved when it stops appearing, and can be acked so a known issue stops nagging until it changes.
+
+## Commands at a glance
+
+| Command | Does |
+|---|---|
+| `report` | Upsert a finding; bump its streak; append evidence; escalate if the streak crosses the threshold |
+| `list` | List findings by status (`--open`/`--resolved`/`--escalated`/`--all`) |
+| `show` | One finding's full record, including the chronological evidence trail |
+| `resolve` | Mark a finding resolved (idempotent) |
+| `ack` | Mark a finding triaged and hide it from default views until it changes |
+| `unack` | Clear an ack; the finding resurfaces immediately |
+| `sweep` | Auto-resolve findings not seen in the last K runs |
+| `digest` | Compact banner / `wm.health.*` envelope for SessionStart and health checks |
+| `stuck` | List probe-suspect findings — high report+run counts that never resolved |
 
 ## Install
 
@@ -42,6 +53,10 @@ The directory is created automatically on first use.
 | `resolve_reason`    | TEXT    | reason string (null if not provided)                            |
 | `escalated_at`      | TEXT    | RFC3339 timestamp of escalation (null if not escalated)         |
 | `escalation_reason` | TEXT    | escalation reason (null if not escalated)                       |
+| `acknowledged_at`   | TEXT    | RFC3339 timestamp the finding was acked (null if not acked)     |
+| `ack_reason`        | TEXT    | ack reason (null if not provided)                               |
+| `ack_fingerprint`   | TEXT    | `--until-change` fingerprint watched for auto-clear (nullable)  |
+| `ack_until_run`     | TEXT    | run marker after which the ack auto-clears (nullable)           |
 
 ### `runs` table
 
@@ -167,7 +182,8 @@ docket report \
   [--severity info|warn|crit] \
   [--escalate-threshold <N>] \
   [--evidence <kind>:<ref>] \
-  [--evidence <kind>:<ref>] ...
+  [--evidence <kind>:<ref>] ... \
+  [--fingerprint <opaque>]
 ```
 
 - Creates the finding if new (`status=open`, streak=1, `runs_seen=1`, `report_count=1`).
@@ -179,6 +195,8 @@ docket report \
 - After updating the streak, if `consecutive_runs >= escalate_threshold` and `status=open`, the
   finding is escalated: `status=escalated`, `escalated_at` set, `escalation_reason` written.
   Threshold defaults to 3; overridden by `DOCKET_ESCALATE_THRESHOLD` env or `--escalate-threshold`.
+- `--fingerprint <opaque>` participates in ack auto-clear: if the finding is acked with an
+  `--until-change` fingerprint and this value differs, the ack is cleared so the finding resurfaces.
 
 ### `list`
 
@@ -213,6 +231,27 @@ docket resolve <key> [--reason <text>]
 ```
 
 Idempotent. Exits nonzero if the key is unknown.
+
+### `ack` / `unack`
+
+Acknowledging a finding marks it triaged and hides it from the default `list`, `digest`, and
+`stuck` views — without resolving it. The finding stays fully tracked; its streak still advances.
+An ack is the answer to "yes, I know, stop telling me — for now."
+
+```sh
+docket ack <key> [--reason <text>] [--until-change <fingerprint>] [--runs <run-id>]
+docket unack <key>
+```
+
+The ack can carry its own expiry:
+
+- `--until-change <fingerprint>` — the ack auto-clears the next time `report --fingerprint` supplies
+  a *different* value. Use this when "I've seen it" only holds while the underlying state is unchanged
+  (e.g. a known-stale binary at a specific inode). An ack with no fingerprint persists regardless.
+- `--runs <run-id>` — clear the ack once the run sequence advances past this marker.
+
+`unack` clears the ack immediately; it is a no-op (still exit 0) if the finding wasn't acked.
+Pass `--include-acked` to `list`, `digest`, or `stuck` to fold acked findings back into the view.
 
 ### `sweep`
 
@@ -416,6 +455,22 @@ Integrating this adds one-to-three lines to the banner showing open/escalated fi
 the oldest finding's run-age, and any escalated keys — identical information to what
 `docket list` shows, collapsed to banner-safe width.
 
+## stuck — probe-suspect findings
+
+A finding reported many times across many runs but never resolved is a signal about the *probe*, not
+just the target: a check that fires forever without ever clearing usually doesn't match reality.
+`docket stuck` surfaces exactly those.
+
+```sh
+docket stuck [--min-reports N] [--min-runs M] [--key <substr>] [--format text|json] [--include-acked]
+```
+
+Lists open findings where `report_count >= N` (default 6) **and** `runs_seen >= M` (default 5) **and**
+the finding is unresolved. `--key` filters to keys containing a substring. JSON output adds a
+`suspect_reason` per row. It is a pure read — no writes. An empty result prints
+`no probe-suspect findings` and exits 0. Acked findings are excluded unless `--include-acked`.
+
 ## License
 
 MIT OR Apache-2.0
+
